@@ -1,13 +1,21 @@
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+
 use std::{fs, iter};
 
 fn main() {
     let tokenizer = Tokenizer::new();
 
-    let tokens = tokenizer.tokenize("Hello world!");
-    println!("tokens: {tokens:?}");
+    let input_string = "Hello world!";
+
+    println!("Tokenizing the input string {input_string}");
+    let tokens = tokenizer.tokenize(input_string);
+    println!("Got tokens: {tokens:?}");
+
+    println!("Detokenizing the tokens {tokens:?}");
+    let output = tokenizer.detokenize(&tokens);
+    println!("Got ouput: {output}");
 }
 
 type Token = u32;
@@ -206,8 +214,25 @@ impl Tokenizer {
         symbols
     }
 
-    fn detokenize(&self, _input: &[Token]) -> String {
-        todo!()
+    fn detokenize(&self, input: &[Token]) -> String {
+        let mut text = String::new();
+
+        for token in input {
+            text.push_str(self.reverse_mappings.get(token).expect("token not found"));
+        }
+
+        let mut bytes = Vec::new();
+
+        for char in text.chars() {
+            bytes.push(
+                *self
+                    .reverse_byte_mappings
+                    .get(&char)
+                    .expect("char mapping not found"),
+            );
+        }
+
+        String::from_utf8(bytes).expect("must be valid utf-8 after reverting the mapping")
     }
 }
 
@@ -278,5 +303,90 @@ mod tests {
                 5641, 30640, 33623, 16764
             ]
         );
+    }
+
+    #[test]
+    fn it_detokenizes_correctly_1() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = vec![15496, 995, 0];
+
+        // when
+        let tokens = tokenizer.detokenize(&input);
+
+        // then
+        // taken from https://tokenizer.model.box/?model=gpt2
+        assert_eq!(tokens, "Hello world!");
+    }
+
+    #[test]
+    fn it_detokenizes_correctly_2() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = vec![1212, 318, 1223, 517, 3716, 13];
+
+        // when
+        let tokens = tokenizer.detokenize(&input);
+
+        // then
+        // taken from https://tokenizer.model.box/?model=gpt2
+        assert_eq!(tokens, "This is something more complex.");
+    }
+
+    #[test]
+    fn it_detokenizes_correctly_3() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = vec![36, 568, 1658, 435, 2188, 285, 40138, 2299, 291, 4533, 13];
+
+        // when
+        let tokens = tokenizer.detokenize(&input);
+
+        // then
+        // taken from https://tokenizer.model.box/?model=gpt2
+        assert_eq!(tokens, "Eso es algo más complicado.");
+    }
+
+    #[test]
+    fn it_detokenizes_correctly_4() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = vec![
+            46036, 39258, 31676, 43266, 33180, 30201, 164, 97, 229, 37239, 239, 26945, 43266, 5641,
+            30640, 33623, 16764,
+        ];
+
+        // when
+        let tokens = tokenizer.detokenize(&input);
+
+        // then
+        // taken from https://tokenizer.model.box/?model=gpt2
+        assert_eq!(tokens, "これはもっと複雑なものです。");
+    }
+
+    #[test]
+    fn it_tokenizes_and_detokenizes_correctly() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = "This is an end-to-end integration";
+
+        // when
+        let output = tokenizer.detokenize(&tokenizer.tokenize(input));
+
+        // then
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn it_tokenizes_and_detokenizes_utf8_correctly() {
+        // given
+        let tokenizer = Tokenizer::new();
+        let input = "これはエンドツーエンドの統合です。";
+
+        // when
+        let output = tokenizer.detokenize(&tokenizer.tokenize(input));
+
+        // then
+        assert_eq!(input, output);
     }
 }
