@@ -2,7 +2,13 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+use std::error::Error;
+use std::mem;
+use std::path::Path;
 use std::{fs, iter};
+
+// see https://openaipublic.blob.core.windows.net/gpt-2/models/124M/hparams.json
+const NUM_LAYERS: u8 = 12;
 
 fn main() {
     let tokenizer = Tokenizer::new();
@@ -13,9 +19,22 @@ fn main() {
     let tokens = tokenizer.tokenize(input_string);
     println!("Got tokens: {tokens:?}");
 
-    println!("Detokenizing the tokens {tokens:?}");
-    let output = tokenizer.detokenize(&tokens);
-    println!("Got ouput: {output}");
+    let mut llm = LargeLanguageModel::try_from(Path::new("resources/model.safetensors")).unwrap();
+
+    llm.initialize(&tokens[..tokens.len() - 1]);
+    println!("Initialized the LLM");
+
+    let num_samples: u32 = 2;
+
+    println!("Sampling {num_samples} tokens.");
+    let mut curr_token = *tokens.last().unwrap();
+    for _ in 0..num_samples {
+        let next_token = llm.sample_one(curr_token);
+        curr_token = next_token;
+
+        let next_output = tokenizer.detokenize(&vec![next_token]);
+        print!("{next_output}");
+    }
 }
 
 type Token = u32;
@@ -233,6 +252,190 @@ impl Tokenizer {
         }
 
         String::from_utf8(bytes).expect("must be valid utf-8 after reverting the mapping")
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct LayerSpec {
+    shape: Vec<u64>,
+    data_offsets: Vec<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HeaderSpec {
+    #[serde(rename = "__metadata__")]
+    _metadata: serde_json::Value,
+    #[serde(flatten)]
+    layers: HashMap<String, LayerSpec>,
+}
+
+struct SafeTensors<'a> {
+    layers: HashMap<String, LayerSpec>,
+    raw_data: &'a [u8],
+}
+
+impl<'a> SafeTensors<'a> {
+    fn new(layers: HashMap<String, LayerSpec>, raw_data: &'a [u8]) -> Self {
+        Self { layers, raw_data }
+    }
+}
+
+impl<'a> SafeTensors<'a> {
+    fn get_tensor_by_name(&self, name: &str) -> Tensor2D {
+        let layer_def = self
+            .layers
+            .get(name)
+            .unwrap_or_else(|| panic!("must contain tensor with name {name}"));
+
+        let raw_data =
+            &self.raw_data[layer_def.data_offsets[0] as usize..layer_def.data_offsets[1] as usize];
+
+        let mut data = Vec::with_capacity(raw_data.len() / mem::size_of::<f32>());
+
+        for raw_float in raw_data.chunks_exact(mem::size_of::<f32>()) {
+            let float = f32::from_le_bytes(
+                raw_float
+                    .try_into()
+                    .expect("data must encode valid f32 values"),
+            );
+            data.push(float);
+        }
+
+        let mut shape_iter = layer_def.shape.iter();
+
+        let shape = (
+            *shape_iter.next().unwrap() as usize,
+            *shape_iter.next().unwrap_or(&1) as usize,
+        );
+
+        Tensor2D::new(shape, data)
+    }
+}
+
+#[derive(Debug)]
+enum Dimension {
+    Row,
+    Column,
+}
+
+#[derive(Debug)]
+struct Tensor2D {
+    shape: (usize, usize),
+    data: Vec<f32>,
+}
+
+impl Tensor2D {
+    fn new(shape: (usize, usize), data: Vec<f32>) -> Self {
+        Self { shape, data }
+    }
+
+    fn get(&self, dim: Dimension, index: usize) -> &[f32] {
+        match dim {
+            Dimension::Row => {
+                let real_index = index * self.shape.1;
+                &self.data[real_index..real_index + self.shape.1]
+            }
+            Dimension::Column => {
+                let real_index = index * self.shape.0;
+                &self.data[real_index..real_index + self.shape.0]
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransformerBlock {
+    layer_norm_1_weight: Tensor2D, // (n_embd,)
+    layer_norm_1_bias: Tensor2D,   // (n_embd, )
+
+    layer_norm_2_weight: Tensor2D, // (n_embd, )
+    layer_norm_2_bias: Tensor2D,   // (n_embd, )
+
+    mlp_fc_weight: Tensor2D, // (n_embd, n_neurons)
+    mlp_fc_bias: Tensor2D,   // (n_neurons, )
+
+    mlp_proj_weight: Tensor2D, // (n_neurons, n_embd)
+    mlp_proj_bias: Tensor2D,   // (n_embd, )
+}
+
+impl TransformerBlock {
+    fn run(&self, context_vector: Vec<f32>) -> Vec<f32> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+struct LargeLanguageModel {
+    wte: Tensor2D, // (n_vocab, n_embd)
+    wpe: Tensor2D, // (n_ctx, n_embd)
+
+    transformer_blocks: Vec<TransformerBlock>,
+
+    current_position: usize,
+}
+
+impl LargeLanguageModel {
+    fn new(wte: Tensor2D, wpe: Tensor2D, transformer_blocks: Vec<TransformerBlock>) -> Self {
+        Self {
+            wte,
+            wpe,
+            transformer_blocks,
+            current_position: 0,
+        }
+    }
+
+    fn initialize(&mut self, tokens: &[Token]) {
+        for token in tokens {
+            self.sample_one(*token);
+        }
+    }
+
+    fn sample_one(&mut self, token: Token) -> Token {
+        let token_embedding = self.wte.get(Dimension::Row, token as usize);
+        let position_embedding = self.wpe.get(Dimension::Row, self.current_position);
+
+        let mut context_vector: Vec<f32> = token_embedding
+            .iter()
+            .zip(position_embedding.iter())
+            .map(|(left, right)| left + right)
+            .collect();
+
+        for transformer_block in self.transformer_blocks.iter_mut() {
+            context_vector = transformer_block.run(context_vector);
+        }
+
+        println!("{context_vector:?}");
+        self.current_position += 1;
+        0
+    }
+}
+
+impl TryFrom<&Path> for LargeLanguageModel {
+    type Error = Box<dyn Error>;
+
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let bytes = fs::read(path)?;
+
+        let bytes_for_header_length = mem::size_of::<u64>();
+
+        let header_size = u64::from_le_bytes(bytes[..bytes_for_header_length].try_into()?);
+
+        let header_data =
+            &bytes[bytes_for_header_length..(header_size as usize + bytes_for_header_length)];
+
+        let header: HeaderSpec = serde_json::from_slice(header_data)?;
+
+        let safe_tensors = SafeTensors::new(
+            header.layers,
+            &bytes[bytes_for_header_length + header_size as usize..],
+        );
+
+        let wte = safe_tensors.get_tensor_by_name("wte.weight");
+        let wpe = safe_tensors.get_tensor_by_name("wpe.weight");
+
+        for i in 0..NUM_LAYERS {}
+
+        Ok(LargeLanguageModel::new(wte, wpe, vec![]))
     }
 }
 
