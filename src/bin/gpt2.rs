@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 
 use std::error::Error;
 use std::mem;
+use std::ops::{AddAssign, DivAssign, MulAssign};
 use std::path::Path;
 use std::{fs, iter};
 
 // see https://openaipublic.blob.core.windows.net/gpt-2/models/124M/hparams.json
 const NUM_LAYERS: u8 = 12;
+const NUM_HEADS: u8 = 12;
 
 fn main() {
     let tokenizer = Tokenizer::new();
@@ -32,7 +34,7 @@ fn main() {
         let next_token = llm.sample_one(curr_token);
         curr_token = next_token;
 
-        let next_output = tokenizer.detokenize(&vec![next_token]);
+        let next_output = tokenizer.detokenize(&[next_token]);
         print!("{next_output}");
     }
 }
@@ -301,12 +303,11 @@ impl<'a> SafeTensors<'a> {
             data.push(float);
         }
 
-        let mut shape_iter = layer_def.shape.iter();
-
-        let shape = (
-            *shape_iter.next().unwrap() as usize,
-            *shape_iter.next().unwrap_or(&1) as usize,
-        );
+        let shape = if layer_def.shape.len() == 1 {
+            (1, layer_def.shape[0] as usize)
+        } else {
+            (layer_def.shape[0] as usize, layer_def.shape[1] as usize)
+        };
 
         Tensor2D::new(shape, data)
     }
@@ -318,7 +319,7 @@ enum Dimension {
     Column,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Tensor2D {
     shape: (usize, usize),
     data: Vec<f32>,
@@ -341,12 +342,125 @@ impl Tensor2D {
             }
         }
     }
+
+    fn mat_mul(&self, other: &Tensor2D) -> Tensor2D {
+        if self.shape.1 != other.shape.0 {
+            panic!("invalid shapes for matrix multiplication");
+        }
+
+        let mut data = vec![0_f32; self.shape.0 * other.shape.1];
+
+        for row_idx_a in 0..self.shape.0 {
+            for col_idx_b in 0..other.shape.1 {
+                let mut sum = 0_f32;
+                for col_idx_a in 0..self.shape.1 {
+                    sum += self.data[row_idx_a * self.shape.1 + col_idx_a]
+                        * other.data[col_idx_a * other.shape.1 + col_idx_b];
+                }
+
+                data[row_idx_a * other.shape.1 + col_idx_b] = sum;
+            }
+        }
+
+        Tensor2D::new((self.shape.0, other.shape.1), data)
+    }
+
+    fn standardize(&mut self) {
+        // normalization
+        let len = self.data.len() as f32;
+        let mean: f32 = self.data.iter().sum::<f32>() / len;
+        let variance: f32 = self
+            .data
+            .iter()
+            .map(|val| (val - mean).powi(2))
+            .sum::<f32>()
+            / len;
+
+        let epsilon = 1e-5;
+        let std_dev = (variance + epsilon).sqrt();
+
+        for i in 0..self.data.len() {
+            self.data[i] = (self.data[i] - mean) / std_dev;
+        }
+    }
+
+    fn soft_max(&mut self) {
+        let max = self.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let mut sum = 0_f32;
+
+        for val in &mut self.data {
+            *val = (*val - max).exp();
+            sum += *val;
+        }
+
+        for val in &mut self.data {
+            *val /= sum;
+        }
+    }
+
+    fn transpose(&self) -> Tensor2D {
+        let (rows, cols) = self.shape;
+        let mut data = vec![0_f32; rows * cols];
+
+        for row in 0..rows {
+            for col in 0..cols {
+                data[col * rows + row] = self.data[row * cols + col];
+            }
+        }
+
+        Tensor2D::new((cols, rows), data)
+    }
+}
+
+impl AddAssign<&Tensor2D> for Tensor2D {
+    fn add_assign(&mut self, rhs: &Self) {
+        if !(self.shape.0 == rhs.shape.0 && self.shape.1 == rhs.shape.1) {
+            panic!("tensors must be of same shape for addition");
+        }
+        for row_idx in 0..self.shape.0 {
+            for col_idx in 0..self.shape.1 {
+                let real_idx = row_idx * self.shape.1 + col_idx;
+
+                self.data[real_idx] += rhs.data[real_idx];
+            }
+        }
+    }
+}
+
+impl MulAssign<&Tensor2D> for Tensor2D {
+    fn mul_assign(&mut self, rhs: &Self) {
+        if !(self.shape.0 == rhs.shape.0 && self.shape.1 == rhs.shape.1) {
+            panic!("tensors must be of same shape for multiplication");
+        }
+        for row_idx in 0..self.shape.0 {
+            for col_idx in 0..self.shape.1 {
+                let real_idx = row_idx * self.shape.1 + col_idx;
+
+                self.data[real_idx] *= rhs.data[real_idx];
+            }
+        }
+    }
+}
+
+impl DivAssign<u8> for Tensor2D {
+    fn div_assign(&mut self, rhs: u8) {
+        for row_idx in 0..self.shape.0 {
+            for col_idx in 0..self.shape.1 {
+                let real_index = row_idx * self.shape.1 + col_idx;
+                self.data[real_index] /= rhs as f32;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct TransformerBlock {
     layer_norm_1_weight: Tensor2D, // (n_embd,)
     layer_norm_1_bias: Tensor2D,   // (n_embd, )
+
+    multi_head_attention_weight: Tensor2D, // (n_embd, 3 * n_embd)
+    multi_head_attention_bias: Tensor2D,   // (3 * n_embd, )
 
     layer_norm_2_weight: Tensor2D, // (n_embd, )
     layer_norm_2_bias: Tensor2D,   // (n_embd, )
@@ -356,11 +470,100 @@ struct TransformerBlock {
 
     mlp_proj_weight: Tensor2D, // (n_neurons, n_embd)
     mlp_proj_bias: Tensor2D,   // (n_embd, )
+
+    key_cache: Vec<Tensor2D>,
+    value_cache: Vec<Tensor2D>,
 }
 
 impl TransformerBlock {
-    fn run(&self, context_vector: Vec<f32>) -> Vec<f32> {
-        todo!()
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        layer_norm_1_weight: Tensor2D,
+        layer_norm_1_bias: Tensor2D,
+        multi_head_attention_weight: Tensor2D,
+        multi_head_attention_bias: Tensor2D,
+        layer_norm_2_weight: Tensor2D,
+        layer_norm_2_bias: Tensor2D,
+        mlp_fc_weight: Tensor2D,
+        mlp_fc_bias: Tensor2D,
+        mlp_proj_weight: Tensor2D,
+        mlp_proj_bias: Tensor2D,
+    ) -> Self {
+        Self {
+            layer_norm_1_weight,
+            layer_norm_1_bias,
+            multi_head_attention_weight,
+            multi_head_attention_bias,
+            layer_norm_2_weight,
+            layer_norm_2_bias,
+            mlp_fc_weight,
+            mlp_fc_bias,
+            mlp_proj_weight,
+            mlp_proj_bias,
+            key_cache: vec![],
+            value_cache: vec![],
+        }
+    }
+
+    fn run(&mut self, mut context_tensor: Tensor2D) -> Tensor2D {
+        let _residual = context_tensor.clone();
+
+        // layer norm 1
+        context_tensor.standardize();
+        context_tensor *= &self.layer_norm_1_weight;
+        context_tensor += &self.layer_norm_1_bias;
+
+        // multi-head attention
+        context_tensor = context_tensor.mat_mul(&self.multi_head_attention_weight);
+        context_tensor += &self.multi_head_attention_bias;
+
+        let n_embd = context_tensor.shape.1 / 3; // must contain query, key and value
+
+        let query = Tensor2D::new((1, n_embd), context_tensor.data[0..n_embd].to_owned());
+
+        // add key and value vector to the cache
+        self.key_cache.push(Tensor2D::new(
+            (1, n_embd),
+            context_tensor.data[n_embd..n_embd * 2].to_owned(),
+        ));
+        self.value_cache.push(Tensor2D::new(
+            (1, n_embd),
+            context_tensor.data[n_embd * 2..n_embd * 3].to_owned(),
+        ));
+
+        let head_dim = n_embd / NUM_HEADS as usize;
+
+        let mut all_attention_scores = Vec::with_capacity(n_embd);
+
+        for head_idx in 0..NUM_HEADS as usize {
+            let start_idx = head_idx * head_dim;
+            let end_idx = start_idx + head_dim;
+
+            let query = Tensor2D::new((1, head_dim), query.data[start_idx..end_idx].to_owned());
+
+            let mut key_data = Vec::with_capacity(head_dim * self.key_cache.len());
+            let mut value_data = Vec::with_capacity(head_dim * self.key_cache.len());
+
+            for i in 0..self.key_cache.len() {
+                key_data.extend_from_slice(&self.key_cache[i].data[start_idx..end_idx]);
+                value_data.extend_from_slice(&self.value_cache[i].data[start_idx..end_idx]);
+            }
+
+            let key = Tensor2D::new((self.key_cache.len(), head_dim), key_data);
+            let value = Tensor2D::new((self.key_cache.len(), head_dim), value_data);
+
+            let mut attention_scores = query.mat_mul(&key.transpose()); // (1, n_pos)
+            attention_scores /= 8; // sqrt of head_dim
+            attention_scores.soft_max();
+
+            attention_scores = attention_scores.mat_mul(&value); // (1, head_dim)
+            all_attention_scores.extend_from_slice(attention_scores.get(Dimension::Row, 0));
+        }
+
+        let attention_tensor = Tensor2D::new((1, n_embd), all_attention_scores);
+
+        todo!("{:?}", context_tensor);
+        todo!("{:?}", attention_tensor);
     }
 }
 
@@ -393,18 +596,25 @@ impl LargeLanguageModel {
     fn sample_one(&mut self, token: Token) -> Token {
         let token_embedding = self.wte.get(Dimension::Row, token as usize);
         let position_embedding = self.wpe.get(Dimension::Row, self.current_position);
+        println!(
+            "len of token and position embeddings: {}, {}",
+            token_embedding.len(),
+            position_embedding.len()
+        );
 
-        let mut context_vector: Vec<f32> = token_embedding
+        // len == n_embd
+        let context_vector: Vec<f32> = token_embedding
             .iter()
             .zip(position_embedding.iter())
             .map(|(left, right)| left + right)
             .collect();
 
+        let mut context_tensor = Tensor2D::new((1, context_vector.len()), context_vector);
+
         for transformer_block in self.transformer_blocks.iter_mut() {
-            context_vector = transformer_block.run(context_vector);
+            context_tensor = transformer_block.run(context_tensor);
         }
 
-        println!("{context_vector:?}");
         self.current_position += 1;
         0
     }
@@ -433,9 +643,39 @@ impl TryFrom<&Path> for LargeLanguageModel {
         let wte = safe_tensors.get_tensor_by_name("wte.weight");
         let wpe = safe_tensors.get_tensor_by_name("wpe.weight");
 
-        for i in 0..NUM_LAYERS {}
+        let mut transformer_blocks: Vec<TransformerBlock> = Vec::new();
 
-        Ok(LargeLanguageModel::new(wte, wpe, vec![]))
+        for i in 0..NUM_LAYERS {
+            let layer_norm_1_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.weight"));
+            let layer_norm_1_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.bias"));
+
+            let multi_head_attention_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_attn.weight"));
+            let multi_head_attention_bias =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_attn.bias"));
+
+            let layer_norm_2_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.weight"));
+            let layer_norm_2_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.bias"));
+
+            let transformer_block = TransformerBlock::new(
+                layer_norm_1_weight,
+                layer_norm_1_bias,
+                multi_head_attention_weight,
+                multi_head_attention_bias,
+                layer_norm_2_weight,
+                layer_norm_2_bias,
+                Tensor2D::new((0, 0), vec![]),
+                Tensor2D::new((0, 0), vec![]),
+                Tensor2D::new((0, 0), vec![]),
+                Tensor2D::new((0, 0), vec![]),
+            );
+
+            transformer_blocks.push(transformer_block);
+        }
+
+        Ok(LargeLanguageModel::new(wte, wpe, transformer_blocks))
     }
 }
 
@@ -591,5 +831,130 @@ mod tests {
 
         // then
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn mat_mul_2x3_times_3x2() {
+        // given
+        let a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((3, 2), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+
+        // when
+        let c = a.mat_mul(&b);
+
+        // then
+        // [1,2,3] * [7,9,11] = 7+18+33 = 58    [1,2,3] * [8,10,12] = 8+20+36 = 64
+        // [4,5,6] * [7,9,11] = 28+45+66 = 139  [4,5,6] * [8,10,12] = 32+50+72 = 154
+        assert_eq!(c.shape, (2, 2));
+        assert_eq!(c.data, vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn mat_mul_with_identity() {
+        // given
+        let a = Tensor2D::new((2, 2), vec![5.0, 3.0, 2.0, 7.0]);
+        let identity = Tensor2D::new((2, 2), vec![1.0, 0.0, 0.0, 1.0]);
+
+        // when
+        let c = a.mat_mul(&identity);
+
+        // then
+        assert_eq!(c.shape, (2, 2));
+        assert_eq!(c.data, vec![5.0, 3.0, 2.0, 7.0]);
+    }
+
+    #[test]
+    fn mat_mul_different_output_shape() {
+        // given
+        let a = Tensor2D::new((2, 2), vec![1.0, 2.0, 3.0, 4.0]);
+        let b = Tensor2D::new((2, 3), vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+
+        // when
+        let c = a.mat_mul(&b);
+
+        // then
+        // [1,2] * [5,8] = 5+16 = 21   [1,2] * [6,9] = 6+18 = 24   [1,2] * [7,10] = 7+20 = 27
+        // [3,4] * [5,8] = 15+32 = 47  [3,4] * [6,9] = 18+36 = 54  [3,4] * [7,10] = 21+40 = 61
+        assert_eq!(c.shape, (2, 3));
+        assert_eq!(c.data, vec![21.0, 24.0, 27.0, 47.0, 54.0, 61.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid shapes for matrix multiplication")]
+    fn mat_mul_incompatible_shapes_panics() {
+        // given
+        let a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((2, 2), vec![1.0, 2.0, 3.0, 4.0]);
+
+        // when
+        a.mat_mul(&b);
+    }
+
+    #[test]
+    fn add_assign_element_wise() {
+        // given
+        let mut a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((2, 3), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+
+        // when
+        a += &b;
+
+        // then
+        assert_eq!(a.shape, (2, 3));
+        assert_eq!(a.data, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "tensors must be of same shape for addition")]
+    fn add_assign_incompatible_shapes_panics() {
+        // given
+        let mut a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // when
+        a += &b;
+    }
+
+    #[test]
+    fn mul_assign_element_wise() {
+        // given
+        let mut a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((2, 3), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+
+        // when
+        a *= &b;
+
+        // then
+        assert_eq!(a.shape, (2, 3));
+        assert_eq!(a.data, vec![2.0, 6.0, 12.0, 20.0, 30.0, 42.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "tensors must be of same shape for multiplication")]
+    fn mul_assign_incompatible_shapes_panics() {
+        // given
+        let mut a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = Tensor2D::new((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // when
+        a *= &b;
+    }
+
+    #[test]
+    fn transpose_swaps_rows_and_columns() {
+        // given
+        // [1, 2, 3]
+        // [4, 5, 6]
+        let a = Tensor2D::new((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // when
+        let t = a.transpose();
+
+        // then
+        // [1, 4]
+        // [2, 5]
+        // [3, 6]
+        assert_eq!(t.shape, (3, 2));
+        assert_eq!(t.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 }
