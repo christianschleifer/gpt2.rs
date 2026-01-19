@@ -1,8 +1,10 @@
 use regex::Regex;
+
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 use std::error::Error;
+use std::io::{self, BufWriter, Write};
 use std::mem;
 use std::ops::{AddAssign, DivAssign, MulAssign};
 use std::path::Path;
@@ -15,27 +17,26 @@ const NUM_HEADS: u8 = 12;
 fn main() {
     let tokenizer = Tokenizer::new();
 
-    let input_string = "Hello world!";
+    let input_string = "Medicine is ";
 
-    println!("Tokenizing the input string {input_string}");
     let tokens = tokenizer.tokenize(input_string);
-    println!("Got tokens: {tokens:?}");
 
     let mut llm = LargeLanguageModel::try_from(Path::new("resources/model.safetensors")).unwrap();
 
     llm.initialize(&tokens[..tokens.len() - 1]);
-    println!("Initialized the LLM");
 
-    let num_samples: u32 = 2;
+    let num_samples: u32 = 25;
 
-    println!("Sampling {num_samples} tokens.");
+    let mut writer = BufWriter::new(io::stdout());
+    print!("{input_string}");
     let mut curr_token = *tokens.last().unwrap();
     for _ in 0..num_samples {
         let next_token = llm.sample_one(curr_token);
         curr_token = next_token;
 
         let next_output = tokenizer.detokenize(&[next_token]);
-        print!("{next_output}");
+        write!(writer, "{next_output}").unwrap();
+        writer.flush().unwrap();
     }
 }
 
@@ -399,6 +400,14 @@ impl Tensor2D {
         }
     }
 
+    fn gelu(&mut self) {
+        const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+
+        for val in &mut self.data {
+            *val = 0.5 * *val * (1.0 + (SQRT_2_OVER_PI * (*val + 0.044_715 * val.powi(3))).tanh());
+        }
+    }
+
     fn transpose(&self) -> Tensor2D {
         let (rows, cols) = self.shape;
         let mut data = vec![0_f32; rows * cols];
@@ -456,14 +465,17 @@ impl DivAssign<u8> for Tensor2D {
 
 #[derive(Debug)]
 struct TransformerBlock {
-    layer_norm_1_weight: Tensor2D, // (n_embd,)
-    layer_norm_1_bias: Tensor2D,   // (n_embd, )
+    ln_1_weight: Tensor2D, // (n_embd,)
+    ln_1_bias: Tensor2D,   // (n_embd, )
 
-    multi_head_attention_weight: Tensor2D, // (n_embd, 3 * n_embd)
-    multi_head_attention_bias: Tensor2D,   // (3 * n_embd, )
+    attn_c_attn_weight: Tensor2D, // (n_embd, 3 * n_embd)
+    attn_c_attn_bias: Tensor2D,   // (3 * n_embd, )
+    //
+    attn_c_proj_weight: Tensor2D, // (n_embd, n_embd)
+    attn_c_proj_bias: Tensor2D,   // (1, n_embd)
 
-    layer_norm_2_weight: Tensor2D, // (n_embd, )
-    layer_norm_2_bias: Tensor2D,   // (n_embd, )
+    ln_2_weight: Tensor2D, // (n_embd, )
+    ln_2_bias: Tensor2D,   // (n_embd, )
 
     mlp_fc_weight: Tensor2D, // (n_embd, n_neurons)
     mlp_fc_bias: Tensor2D,   // (n_neurons, )
@@ -478,24 +490,28 @@ struct TransformerBlock {
 impl TransformerBlock {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        layer_norm_1_weight: Tensor2D,
-        layer_norm_1_bias: Tensor2D,
-        multi_head_attention_weight: Tensor2D,
-        multi_head_attention_bias: Tensor2D,
-        layer_norm_2_weight: Tensor2D,
-        layer_norm_2_bias: Tensor2D,
+        ln_1_weight: Tensor2D,
+        ln_1_bias: Tensor2D,
+        attn_c_attn_weight: Tensor2D,
+        attn_c_attn_bias: Tensor2D,
+        attn_c_proj_weight: Tensor2D,
+        attn_c_proj_bias: Tensor2D,
+        ln_2_weight: Tensor2D,
+        ln_2_bias: Tensor2D,
         mlp_fc_weight: Tensor2D,
         mlp_fc_bias: Tensor2D,
         mlp_proj_weight: Tensor2D,
         mlp_proj_bias: Tensor2D,
     ) -> Self {
         Self {
-            layer_norm_1_weight,
-            layer_norm_1_bias,
-            multi_head_attention_weight,
-            multi_head_attention_bias,
-            layer_norm_2_weight,
-            layer_norm_2_bias,
+            ln_1_weight,
+            ln_1_bias,
+            attn_c_attn_weight,
+            attn_c_attn_bias,
+            attn_c_proj_weight,
+            attn_c_proj_bias,
+            ln_2_weight,
+            ln_2_bias,
             mlp_fc_weight,
             mlp_fc_bias,
             mlp_proj_weight,
@@ -506,16 +522,16 @@ impl TransformerBlock {
     }
 
     fn run(&mut self, mut context_tensor: Tensor2D) -> Tensor2D {
-        let _residual = context_tensor.clone();
+        let residual = context_tensor.clone();
 
         // layer norm 1
         context_tensor.standardize();
-        context_tensor *= &self.layer_norm_1_weight;
-        context_tensor += &self.layer_norm_1_bias;
+        context_tensor *= &self.ln_1_weight;
+        context_tensor += &self.ln_1_bias;
 
         // multi-head attention
-        context_tensor = context_tensor.mat_mul(&self.multi_head_attention_weight);
-        context_tensor += &self.multi_head_attention_bias;
+        context_tensor = context_tensor.mat_mul(&self.attn_c_attn_weight);
+        context_tensor += &self.attn_c_attn_bias;
 
         let n_embd = context_tensor.shape.1 / 3; // must contain query, key and value
 
@@ -560,10 +576,29 @@ impl TransformerBlock {
             all_attention_scores.extend_from_slice(attention_scores.get(Dimension::Row, 0));
         }
 
-        let attention_tensor = Tensor2D::new((1, n_embd), all_attention_scores);
+        let mut context_tensor = Tensor2D::new((1, n_embd), all_attention_scores);
+        context_tensor = context_tensor.mat_mul(&self.attn_c_proj_weight);
+        context_tensor += &self.attn_c_proj_bias;
+        context_tensor += &residual;
 
-        todo!("{:?}", context_tensor);
-        todo!("{:?}", attention_tensor);
+        let residual = context_tensor.clone();
+
+        // layer norm 2
+        context_tensor.standardize();
+        context_tensor *= &self.ln_2_weight;
+        context_tensor += &self.ln_2_bias;
+
+        context_tensor = context_tensor.mat_mul(&self.mlp_fc_weight);
+        context_tensor += &self.mlp_fc_bias;
+
+        context_tensor.gelu();
+
+        context_tensor = context_tensor.mat_mul(&self.mlp_proj_weight);
+        context_tensor += &self.mlp_proj_bias;
+
+        context_tensor += &residual;
+
+        context_tensor
     }
 }
 
@@ -574,15 +609,26 @@ struct LargeLanguageModel {
 
     transformer_blocks: Vec<TransformerBlock>,
 
+    ln_f_weight: Tensor2D, // (n_embd,)
+    ln_f_bias: Tensor2D,   // (n_embd,)
+
     current_position: usize,
 }
 
 impl LargeLanguageModel {
-    fn new(wte: Tensor2D, wpe: Tensor2D, transformer_blocks: Vec<TransformerBlock>) -> Self {
+    fn new(
+        wte: Tensor2D,
+        wpe: Tensor2D,
+        transformer_blocks: Vec<TransformerBlock>,
+        ln_f_weight: Tensor2D,
+        ln_f_bias: Tensor2D,
+    ) -> Self {
         Self {
             wte,
             wpe,
             transformer_blocks,
+            ln_f_weight,
+            ln_f_bias,
             current_position: 0,
         }
     }
@@ -596,11 +642,6 @@ impl LargeLanguageModel {
     fn sample_one(&mut self, token: Token) -> Token {
         let token_embedding = self.wte.get(Dimension::Row, token as usize);
         let position_embedding = self.wpe.get(Dimension::Row, self.current_position);
-        println!(
-            "len of token and position embeddings: {}, {}",
-            token_embedding.len(),
-            position_embedding.len()
-        );
 
         // len == n_embd
         let context_vector: Vec<f32> = token_embedding
@@ -615,8 +656,22 @@ impl LargeLanguageModel {
             context_tensor = transformer_block.run(context_tensor);
         }
 
+        context_tensor.standardize();
+        context_tensor *= &self.ln_f_weight;
+        context_tensor += &self.ln_f_bias;
+
+        let logits = context_tensor.mat_mul(&self.wte.transpose());
+
+        let token = logits
+            .data
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx as Token)
+            .unwrap();
+
         self.current_position += 1;
-        0
+        token
     }
 }
 
@@ -646,36 +701,59 @@ impl TryFrom<&Path> for LargeLanguageModel {
         let mut transformer_blocks: Vec<TransformerBlock> = Vec::new();
 
         for i in 0..NUM_LAYERS {
-            let layer_norm_1_weight =
-                safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.weight"));
-            let layer_norm_1_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.bias"));
+            let ln_1_weight = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.weight"));
+            let ln_1_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_1.bias"));
 
-            let multi_head_attention_weight =
+            let attn_c_attn_weight =
                 safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_attn.weight"));
-            let multi_head_attention_bias =
+            let attn_c_attn_bias =
                 safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_attn.bias"));
 
-            let layer_norm_2_weight =
-                safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.weight"));
-            let layer_norm_2_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.bias"));
+            let attn_c_proj_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_proj.weight"));
+            let attn_c_proj_bias =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.attn.c_proj.bias"));
+
+            let ln_2_weight = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.weight"));
+            let ln_2_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.ln_2.bias"));
+
+            let mlp_c_fc_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.mlp.c_fc.weight"));
+            let mlp_c_fc_bias = safe_tensors.get_tensor_by_name(&format!("h.{i}.mlp.c_fc.bias"));
+
+            let mlp_c_proj_weight =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.mlp.c_proj.weight"));
+            let mlp_c_proj_bias =
+                safe_tensors.get_tensor_by_name(&format!("h.{i}.mlp.c_proj.bias"));
 
             let transformer_block = TransformerBlock::new(
-                layer_norm_1_weight,
-                layer_norm_1_bias,
-                multi_head_attention_weight,
-                multi_head_attention_bias,
-                layer_norm_2_weight,
-                layer_norm_2_bias,
-                Tensor2D::new((0, 0), vec![]),
-                Tensor2D::new((0, 0), vec![]),
-                Tensor2D::new((0, 0), vec![]),
-                Tensor2D::new((0, 0), vec![]),
+                ln_1_weight,
+                ln_1_bias,
+                attn_c_attn_weight,
+                attn_c_attn_bias,
+                attn_c_proj_weight,
+                attn_c_proj_bias,
+                ln_2_weight,
+                ln_2_bias,
+                mlp_c_fc_weight,
+                mlp_c_fc_bias,
+                mlp_c_proj_weight,
+                mlp_c_proj_bias,
             );
 
             transformer_blocks.push(transformer_block);
         }
 
-        Ok(LargeLanguageModel::new(wte, wpe, transformer_blocks))
+        let ln_f_weight = safe_tensors.get_tensor_by_name("ln_f.weight");
+        let ln_f_bias = safe_tensors.get_tensor_by_name("ln_f.bias");
+
+        Ok(LargeLanguageModel::new(
+            wte,
+            wpe,
+            transformer_blocks,
+            ln_f_weight,
+            ln_f_bias,
+        ))
     }
 }
 
