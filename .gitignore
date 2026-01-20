@@ -1,4 +1,4 @@
 /target
 /.idea
-/resources/header.json
+/resources/tokenizer.json
 /resources/model.safetensors
