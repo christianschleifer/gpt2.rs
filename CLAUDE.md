@@ -55,13 +55,17 @@ All code lives in a single binary: `src/bin/gpt2.rs`
 
 ## Resources
 
-Model files in `resources/` (gitignored except tokenizer.json):
+Files in `resources/` (gitignored, must be downloaded):
 
-- `tokenizer.json` - GPT-2 vocabulary (50,257 tokens) from HuggingFace
+- `tokenizer.json` - GPT-2 vocabulary (50,257 tokens)
 - `model.safetensors` - 124M parameter GPT-2 weights (548 MB)
-- `header.json` - SafeTensors metadata
+- `demo.gif` - Demo recording for README
 
-Download from: https://huggingface.co/openai-community/gpt2/
+Download model files:
+```bash
+wget https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors -P resources/
+wget https://huggingface.co/openai-community/gpt2/resolve/main/tokenizer.json -P resources/
+```
 
 ## Implementation Status
 
