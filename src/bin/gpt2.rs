@@ -17,7 +17,7 @@ const NUM_HEADS: u8 = 12;
 fn main() {
     let tokenizer = Tokenizer::new();
 
-    let input_string = "Medicine is ";
+    let input_string = "Life is ";
 
     let tokens = tokenizer.tokenize(input_string);
 
