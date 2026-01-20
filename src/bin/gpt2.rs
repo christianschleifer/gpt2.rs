@@ -314,12 +314,6 @@ impl<'a> SafeTensors<'a> {
     }
 }
 
-#[derive(Debug)]
-enum Dimension {
-    Row,
-    Column,
-}
-
 #[derive(Clone, Debug)]
 struct Tensor2D {
     shape: (usize, usize),
@@ -331,17 +325,9 @@ impl Tensor2D {
         Self { shape, data }
     }
 
-    fn get(&self, dim: Dimension, index: usize) -> &[f32] {
-        match dim {
-            Dimension::Row => {
-                let real_index = index * self.shape.1;
-                &self.data[real_index..real_index + self.shape.1]
-            }
-            Dimension::Column => {
-                let real_index = index * self.shape.0;
-                &self.data[real_index..real_index + self.shape.0]
-            }
-        }
+    fn get_row(&self, index: usize) -> &[f32] {
+        let real_index = index * self.shape.1;
+        &self.data[real_index..real_index + self.shape.1]
     }
 
     fn mat_mul(&self, other: &Tensor2D) -> Tensor2D {
@@ -573,7 +559,7 @@ impl TransformerBlock {
             attention_scores.soft_max();
 
             attention_scores = attention_scores.mat_mul(&value); // (1, head_dim)
-            all_attention_scores.extend_from_slice(attention_scores.get(Dimension::Row, 0));
+            all_attention_scores.extend_from_slice(attention_scores.get_row(0));
         }
 
         let mut context_tensor = Tensor2D::new((1, n_embd), all_attention_scores);
@@ -640,8 +626,8 @@ impl LargeLanguageModel {
     }
 
     fn sample_one(&mut self, token: Token) -> Token {
-        let token_embedding = self.wte.get(Dimension::Row, token as usize);
-        let position_embedding = self.wpe.get(Dimension::Row, self.current_position);
+        let token_embedding = self.wte.get_row(token as usize);
+        let position_embedding = self.wpe.get_row(self.current_position);
 
         // len == n_embd
         let context_vector: Vec<f32> = token_embedding
