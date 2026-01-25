@@ -325,9 +325,11 @@ impl Tensor2D {
         Self { shape, data }
     }
 
-    fn get_row(&self, index: usize) -> &[f32] {
+    fn get_row(&self, index: usize) -> Tensor2D {
         let real_index = index * self.shape.1;
-        &self.data[real_index..real_index + self.shape.1]
+        let data = self.data[real_index..real_index + self.shape.1].to_owned();
+
+        Tensor2D::new((1, self.shape.1), data)
     }
 
     fn mat_mul(&self, other: &Tensor2D) -> Tensor2D {
@@ -451,12 +453,12 @@ impl DivAssign<u8> for Tensor2D {
 
 #[derive(Debug)]
 struct TransformerBlock {
-    ln_1_weight: Tensor2D, // (n_embd,)
+    ln_1_weight: Tensor2D, // (n_embd, )
     ln_1_bias: Tensor2D,   // (n_embd, )
 
     attn_c_attn_weight: Tensor2D, // (n_embd, 3 * n_embd)
     attn_c_attn_bias: Tensor2D,   // (3 * n_embd, )
-    //
+
     attn_c_proj_weight: Tensor2D, // (n_embd, n_embd)
     attn_c_proj_bias: Tensor2D,   // (1, n_embd)
 
@@ -559,7 +561,7 @@ impl TransformerBlock {
             attention_scores.soft_max();
 
             attention_scores = attention_scores.mat_mul(&value); // (1, head_dim)
-            all_attention_scores.extend_from_slice(attention_scores.get_row(0));
+            all_attention_scores.extend_from_slice(&attention_scores.get_row(0).data);
         }
 
         let mut context_tensor = Tensor2D::new((1, n_embd), all_attention_scores);
@@ -629,14 +631,8 @@ impl LargeLanguageModel {
         let token_embedding = self.wte.get_row(token as usize);
         let position_embedding = self.wpe.get_row(self.current_position);
 
-        // len == n_embd
-        let context_vector: Vec<f32> = token_embedding
-            .iter()
-            .zip(position_embedding.iter())
-            .map(|(left, right)| left + right)
-            .collect();
-
-        let mut context_tensor = Tensor2D::new((1, context_vector.len()), context_vector);
+        let mut context_tensor = token_embedding;
+        context_tensor += &position_embedding;
 
         for transformer_block in self.transformer_blocks.iter_mut() {
             context_tensor = transformer_block.run(context_tensor);
